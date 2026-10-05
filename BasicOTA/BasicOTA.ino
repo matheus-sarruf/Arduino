@@ -1,12 +1,7 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-
-#ifndef STASSID
-#define STASSID "your-ssid"
-#define STAPSK  "your-password"
-#endif
 
 const char* ssid = "JOSE";
 const char* password = "70701149";
@@ -22,20 +17,19 @@ void setup() {
     ESP.restart();
   }
 
-  // Port defaults to 8266
-  // ArduinoOTA.setPort(8266);
+  // Porta padrão do ESP32: 3232
+  // ArduinoOTA.setPort(3232);
 
-  // Hostname defaults to esp8266-[ChipID]
-  // ArduinoOTA.setHostname("myesp8266");
+  // Hostname padrão: esp32-[ChipID]
+  // ArduinoOTA.setHostname("myesp32");
 
-  // DEFINA SUA NOVA SENHA AQUI:
   ArduinoOTA.setPassword("3784");
 
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
       type = "sketch";
-    } else { // U_FS
+    } else {
       type = "filesystem";
     }
     Serial.println("Start updating " + type);
