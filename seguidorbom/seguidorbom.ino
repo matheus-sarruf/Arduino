@@ -1,280 +1,317 @@
-// ==================================================
-//   ESP32 - Robo Seguidor AUTONOMO (LINHA PRETA)
-//   + BOTAO DE EMERGENCIA no GPIO 33
-//   + RECONEXAO WIFI AUTOMATICA
-// ==================================================
+#include <BluetoothSerial.h>
 
-#include <WiFi.h>
-#include <ArduinoOTA.h>
+BluetoothSerial SerialBT;
 
-// ---------- Credenciais WiFi ----------
-const char* ssid = "JOSE";
-const char* password = "70701149";
+// ========== PINOS DOS SENSORES ==========
+// -1 = posicao vazia (sem sensor)
+const int numSensores = 16;
+const int pinosSensores[numSensores] = {
+  39, 36, 34, 35, 32, 33, 25, 26,  // Modulo 1 (8 sensores)
+  27, 14, 23, 13, 4, 15, 2, -1     // Modulo 2 (7 sensores + 1 vazio)
+};
 
-// ---------- Sensores ----------
-#define S1 36
-#define S2 39
-#define S3 34
-#define S4 35
-#define S5 16
+bool ehDigital(int pino) { return (pino == 23); }
+bool ehVazio(int pino) { return (pino == -1); }
 
-// ---------- Ponte H ----------
-#define INA 32
-#define IND 18
+// ========== PINOS DOS MOTORES ==========
+#define PWMA 18
+#define AIN1 5
+#define AIN2 17
+#define PWMB 19
+#define BIN1 21
+#define BIN2 22
+#define STBY 16
 
-#define ENA 23
-#define ENB 19
+// ========== CALIBRACAO ==========
+int minVal[numSensores];
+int maxVal[numSensores];
+int normalizado[numSensores];
 
-// ---------- Botao de emergencia ----------
-#define BOTAO 33
+// ========== PID ==========
+float Kp = 0.10;
+float Ki = 0.0;
+float Kd = 2.0;
 
-// ---------- PWM ----------
-#define PWM_FREQ 1000
-#define PWM_RES 8
+// ========== VELOCIDADE ==========
+int velocidadeBase = 130;
 
-// ---------- Servidor TCP ----------
-WiFiServer serverDebug(23);
-#define MAX_CLIENTES 3
-WiFiClient clientes[MAX_CLIENTES];
+// ========== VARIAVEIS DE CONTROLE ==========
+float erro = 0, erroAnterior = 0, integral = 0, derivada = 0, correcao = 0;
+int posicao = 0, ultimaPosicao = 0;
 
-// ============ AJUSTES ============
-int VEL_RETO = 150;
-int VEL_CURVA_LENTA = 110;
-int VEL_CURVA_RAPIDA = 180;
-// =================================
+// ========== ESTADOS ==========
+bool seguindo = false;
+bool debugAtivo = true;
+unsigned long ultimoDebug = 0;
 
-String acaoAtual = "INICIANDO";
-bool paradoPorBotao = false;
+// ========== BUFFER BLUETOOTH ==========
+String bufferBT = "";
 
-// Variavel para controle de reconexao WiFi
-unsigned long ultimaTentativaWiFi = 0;
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("CHOSO");
+  Serial.println("Bluetooth: CHOSO");
 
-// ---------- Log ----------
-void logMsg(const String& msg) {
-  Serial.println(msg);
-  for (int i = 0; i < MAX_CLIENTES; i++)
-    if (clientes[i] && clientes[i].connected()) clientes[i].println(msg);
-}
-
-// ---------- Motores ----------
-void setMotorEsq(int vel) {
-  vel = constrain(vel, 0, 255);
-  if (vel == 0) {
-    digitalWrite(INA, LOW);
-    ledcWrite(ENA, 0);
-  } else {
-    digitalWrite(INA, HIGH);
-    ledcWrite(ENA, vel);
+  for (int i = 0; i < numSensores; i++) {
+    if (ehVazio(pinosSensores[i])) continue;
+    pinMode(pinosSensores[i], INPUT);
+    minVal[i] = 4095;
+    maxVal[i] = 0;
   }
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+  ledcAttach(PWMA, 5000, 8);
+  ledcAttach(PWMB, 5000, 8);
+  parar();
+
+  Serial.println("Calibrando em 3 segundos...");
+  SerialBT.println(">> CALIBRACAO em 3s. Mova o robo sobre a linha e o fundo!");
+  delay(3000);
+  calibrar();
+
+  imprimirAjuda();
 }
 
-void setMotorDir(int vel) {
-  vel = constrain(vel, 0, 255);
-  if (vel == 0) {
-    digitalWrite(IND, LOW);
-    ledcWrite(ENB, 0);
+// ============================================================
+// CALIBRACAO
+// ============================================================
+void calibrar() {
+  Serial.println("CALIBRANDO (8s)...");
+  SerialBT.println(">> CALIBRANDO (8s)...");
+
+  for (int i = 0; i < numSensores; i++) {
+    minVal[i] = 4095;
+    maxVal[i] = 0;
+  }
+
+  unsigned long inicio = millis();
+  while (millis() - inicio < 8000) {
+    for (int i = 0; i < numSensores; i++) {
+      if (ehVazio(pinosSensores[i])) continue;
+      if (ehDigital(pinosSensores[i])) continue;
+      int v = analogRead(pinosSensores[i]);
+      if (v < minVal[i]) minVal[i] = v;
+      if (v > maxVal[i]) maxVal[i] = v;
+    }
+    delay(5);
+  }
+
+  SerialBT.println(">> Calibracao OK!");
+  Serial.println("Calibracao OK!");
+}
+
+// ============================================================
+// CONTROLE DOS MOTORES
+// ============================================================
+void setMotor(int motor, int speed) {
+  if (speed > 255) speed = 255;
+  if (speed < -255) speed = -255;
+
+  if (motor == 1) {
+    if (speed > 0) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); }
+    else if (speed < 0) { digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH); }
+    else { digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW); }
+    ledcWrite(PWMA, abs(speed));
   } else {
-    digitalWrite(IND, HIGH);
-    ledcWrite(ENB, vel);
+    if (speed > 0) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); }
+    else if (speed < 0) { digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH); }
+    else { digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW); }
+    ledcWrite(PWMB, abs(speed));
   }
 }
 
 void parar() {
-  setMotorEsq(0);
-  setMotorDir(0);
+  setMotor(1, 0);
+  setMotor(2, 0);
 }
 
-// ---------- Erro ----------
-// ATENCAO: fita PRETA (0) sobre pista BRANCA (1)
-int calcErro(int s1, int s2, int s3, int s4, int s5) {
-  int soma = 0, ativos = 0;
-  // Invertido para procurar 0 (Preto) em vez de 1 (Branco)
-  if (s1 == 0) {
-    soma += -3;
-    ativos++;
-  }
-  if (s2 == 0) {
-    soma += -1;
-    ativos++;
-  }
-  if (s3 == 0) {
-    soma += 0;
-    ativos++;
-  }
-  if (s4 == 0) {
-    soma += +1;
-    ativos++;
-  }
-  if (s5 == 0) {
-    soma += +3;
-    ativos++;
-  }
-  if (ativos == 0) return 99;
-  return soma / ativos;
-}
-
-// ---------- Logica ----------
-void seguirLinha(int s1, int s2, int s3, int s4, int s5) {
-  int erro = calcErro(s1, s2, s3, s4, s5);
-
-  if (erro == 99) {
-    parar();
-    acaoAtual = "PERDIDO -> PARADO";
-    return;
-  }
-  if (erro <= -2) {
-    setMotorEsq(0);
-    setMotorDir(VEL_CURVA_RAPIDA);
-    acaoAtual = "VIRANDO ESQ FORTE";
-  } else if (erro == -1) {
-    setMotorEsq(VEL_CURVA_LENTA);
-    setMotorDir(VEL_RETO);
-    acaoAtual = "VIRANDO ESQ leve";
-  } else if (erro == 0) {
-    setMotorEsq(VEL_RETO);
-    setMotorDir(VEL_RETO);
-    acaoAtual = "RETO";
-  } else if (erro == 1) {
-    setMotorEsq(VEL_RETO);
-    setMotorDir(VEL_CURVA_LENTA);
-    acaoAtual = "VIRANDO DIR leve";
-  } else {
-    setMotorEsq(VEL_CURVA_RAPIDA);
-    setMotorDir(0);
-    acaoAtual = "VIRANDO DIR FORTE";
-  }
-}
-
-// ---------- Setup ----------
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("\n=== Robo Seguidor AUTONOMO + BOTAO ===");
-
-  pinMode(INA, OUTPUT);
-  digitalWrite(INA, LOW);
-  pinMode(IND, OUTPUT);
-  digitalWrite(IND, LOW);
-  ledcAttach(ENA, PWM_FREQ, PWM_RES);
-  ledcAttach(ENB, PWM_FREQ, PWM_RES);
-  parar();
-
-  pinMode(S1, INPUT);
-  pinMode(S2, INPUT);
-  pinMode(S3, INPUT);
-  pinMode(S4, INPUT);
-  pinMode(S5, INPUT);
-
-  // Botao com pull-up interno
-  pinMode(BOTAO, INPUT_PULLUP);
-
-  // --- WiFi (Tenta conectar por 5s, se falhar continua e tenta no loop) ---
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("Robo_Seguidor");
-  WiFi.begin(ssid, password);
-
-  Serial.print("Conectando WiFi");
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK. IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi nao conectou ainda - vai tentar no loop");
-  }
-
-  // --- Configuracoes do OTA ---
-  ArduinoOTA.setHostname("Robo_Seguidor");
-  ArduinoOTA.setPassword("3784");
-  ArduinoOTA.begin();
-
-  // --- Servidor TCP ---
-  serverDebug.begin();
-  serverDebug.setNoDelay(true);
-
-  Serial.println("Iniciando em 2s...");
-  delay(2000);
-  Serial.println(">>> SEGUINDO <<<\n");
-}
-
-// ---------- Loop ----------
-unsigned long ultimoLog = 0;
-
-void loop() {
-  // Mantem o OTA ativo
-  ArduinoOTA.handle();
-
-  // ---------- RECONEXAO WIFI AUTOMATICA ----------
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - ultimaTentativaWiFi > 5000) {  // Tenta a cada 5 segundos
-      ultimaTentativaWiFi = millis();
-      Serial.println("WiFi caiu ou desconectado. Tentando reconectar...");
-      WiFi.disconnect();
-      WiFi.reconnect();
+// ============================================================
+// LEITURA DOS SENSORES
+// ============================================================
+void lerSensores() {
+  for (int i = 0; i < numSensores; i++) {
+    // Posicao vazia
+    if (ehVazio(pinosSensores[i])) {
+      normalizado[i] = 0;
+      continue;
     }
+
+    // Pino digital (GPIO 23)
+    if (ehDigital(pinosSensores[i])) {
+      int v = digitalRead(pinosSensores[i]);
+      normalizado[i] = v ? 0 : 1000;  // invertido: 1=preto, 0=branco
+      continue;
+    }
+
+    // Pino analogico
+    int v = analogRead(pinosSensores[i]);
+    if (maxVal[i] - minVal[i] == 0) {
+      normalizado[i] = 0;
+    } else {
+      normalizado[i] = (v - minVal[i]) * 1000 / (maxVal[i] - minVal[i]);
+    }
+    if (normalizado[i] < 0) normalizado[i] = 0;
+    if (normalizado[i] > 1000) normalizado[i] = 1000;
+  }
+}
+
+// ============================================================
+// CALCULO DA POSICAO
+// ============================================================
+int calcularPosicao() {
+  long somaPesos = 0;
+  long somaValores = 0;
+
+  for (int i = 0; i < numSensores; i++) {
+    if (ehVazio(pinosSensores[i])) continue;  // pula posicao vazia
+    int peso = (i * 1000) - 7500;
+    somaPesos += (long)peso * normalizado[i];
+    somaValores += normalizado[i];
   }
 
-  // ---------- Servidor TCP Debug ----------
-  if (serverDebug.hasClient()) {
-    for (int i = 0; i < MAX_CLIENTES; i++) {
-      if (!clientes[i] || !clientes[i].connected()) {
-        if (clientes[i]) clientes[i].stop();
-        clientes[i] = serverDebug.available();
-        clientes[i].setNoDelay(true);
-        clientes[i].println("=== Conectado ao Robo Seguidor ===");
-        break;
+  if (somaValores < 500) return 9999;
+  return somaPesos / somaValores;
+}
+
+// ============================================================
+// COMANDOS BLUETOOTH
+// ============================================================
+void imprimirAjuda() {
+  SerialBT.println("==== COMANDOS ====");
+  SerialBT.println("g = Seguir linha");
+  SerialBT.println("s = Parar");
+  SerialBT.println("c = Calibrar novamente");
+  SerialBT.println("w/a/d/x = Teste manual motores");
+  SerialBT.println("p<v> = Kp (ex: p0.15)");
+  SerialBT.println("i<v> = Ki (ex: i0.001)");
+  SerialBT.println("k<v> = Kd (ex: k2.5)");
+  SerialBT.println("v<v> = Velocidade base (ex: v150)");
+  SerialBT.println("show = Ver config atual");
+  SerialBT.println("debug = Liga/desliga debug");
+  SerialBT.println("h = Esta ajuda");
+}
+
+void processarComando(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  char c = cmd.charAt(0);
+  String valor = cmd.substring(1);
+  valor.trim();
+
+  switch (c) {
+    case 'g': seguindo = true; SerialBT.println(">> SEGUINDO LINHA"); break;
+    case 's': seguindo = false; parar(); SerialBT.println(">> PARADO"); break;
+    case 'c': parar(); seguindo = false; delay(300); calibrar(); break;
+    case 'w': setMotor(1, 150); setMotor(2, 150); SerialBT.println(">> FRENTE"); break;
+    case 'a': setMotor(1, -150); setMotor(2, 150); SerialBT.println(">> ESQ"); break;
+    case 'd': setMotor(1, 150); setMotor(2, -150); SerialBT.println(">> DIR"); break;
+    case 'x': setMotor(1, -150); setMotor(2, -150); SerialBT.println(">> RE"); break;
+
+    case 'p':
+      if (valor.length() > 0) Kp = valor.toFloat();
+      SerialBT.print(">> Kp = "); SerialBT.println(Kp, 3);
+      break;
+    case 'i':
+      if (valor.length() > 0) Ki = valor.toFloat();
+      SerialBT.print(">> Ki = "); SerialBT.println(Ki, 4);
+      break;
+    case 'k':
+      if (valor.length() > 0) Kd = valor.toFloat();
+      SerialBT.print(">> Kd = "); SerialBT.println(Kd, 3);
+      break;
+    case 'v':
+      if (valor.length() > 0) velocidadeBase = valor.toInt();
+      SerialBT.print(">> Velocidade = "); SerialBT.println(velocidadeBase);
+      break;
+
+    case 'h': imprimirAjuda(); break;
+
+    default:
+      if (cmd == "show") {
+        SerialBT.print("Kp="); SerialBT.print(Kp, 3);
+        SerialBT.print(" Ki="); SerialBT.print(Ki, 4);
+        SerialBT.print(" Kd="); SerialBT.print(Kd, 3);
+        SerialBT.print(" Vel="); SerialBT.println(velocidadeBase);
+      } else if (cmd == "debug") {
+        debugAtivo = !debugAtivo;
+        SerialBT.print(">> Debug "); SerialBT.println(debugAtivo ? "ON" : "OFF");
+      } else {
+        SerialBT.println(">> Desconhecido. Digite 'h'.");
       }
+  }
+}
+
+// ============================================================
+// LOOP PRINCIPAL
+// ============================================================
+void loop() {
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    if (c == '\n' || c == '\r') {
+      if (bufferBT.length() > 0) {
+        processarComando(bufferBT);
+        bufferBT = "";
+      }
+    } else {
+      bufferBT += c;
+      if (bufferBT.length() > 30) bufferBT = "";
     }
   }
 
-  // ---------- Leitura dos Sensores ----------
-  int s1 = digitalRead(S1);
-  int s2 = digitalRead(S2);
-  int s3 = digitalRead(S3);
-  int s4 = digitalRead(S4);
-  int s5 = digitalRead(S5);
+  lerSensores();
 
-  // ---------- Botao toggle com debounce ----------
-  static bool estadoBotao = false;
-  static bool leituraAnterior = false;
-  static unsigned long ultimaMudanca = 0;
-  const unsigned long DEBOUNCE_MS = 50;
+  if (seguindo) {
+    posicao = calcularPosicao();
 
-  bool leitura = (digitalRead(BOTAO) == LOW);
+    if (posicao == 9999) {
+      if (ultimaPosicao > 0) {
+        setMotor(1, velocidadeBase);
+        setMotor(2, -velocidadeBase / 2);
+      } else {
+        setMotor(1, -velocidadeBase / 2);
+        setMotor(2, velocidadeBase);
+      }
+    } else {
+      erro = posicao;
+      integral += erro;
+      if (integral > 10000) integral = 10000;
+      if (integral < -10000) integral = -10000;
 
-  if (leitura != leituraAnterior) ultimaMudanca = millis();
-  leituraAnterior = leitura;
+      derivada = erro - erroAnterior;
+      erroAnterior = erro;
 
-  if ((millis() - ultimaMudanca) > DEBOUNCE_MS && leitura != estadoBotao) {
-    estadoBotao = leitura;
-    if (estadoBotao) {  // so na BORDA de aperto
-      paradoPorBotao = !paradoPorBotao;
-      if (paradoPorBotao) logMsg(">>> PARADO <<<");
-      else logMsg(">>> RETOMANDO <<<");
+      correcao = Kp * erro + Ki * integral + Kd * derivada;
+      ultimaPosicao = posicao;
+
+      int velEsq = velocidadeBase + (int)correcao;
+      int velDir = velocidadeBase - (int)correcao;
+
+      setMotor(1, velEsq);
+      setMotor(2, velDir);
     }
   }
 
-  // ---------- Logica de Movimento ----------
-  if (paradoPorBotao) {
-    parar();
-    acaoAtual = "PARADO (aperte de novo)";
-  } else {
-    seguirLinha(s1, s2, s3, s4, s5);
+  // --- Debug (mostra X na posicao vazia) ---
+  if (debugAtivo && millis() - ultimoDebug > 200) {
+    ultimoDebug = millis();
+    String msg = "P:" + String(posicao) + " E:" + String(erro, 0) + " C:" + String(correcao, 0) + " | ";
+    for (int i = 0; i < numSensores; i++) {
+      if (ehVazio(pinosSensores[i])) msg += "X";
+      else if (normalizado[i] > 500) msg += "1";
+      else msg += "0";
+      if (i == 7) msg += "|";
+    }
+    SerialBT.println(msg);
   }
 
-  // ---------- Log Serial e TCP ----------
-  if (millis() - ultimoLog > 150) {
-    ultimoLog = millis();
-    int erro = calcErro(s1, s2, s3, s4, s5);
-    char buf[220];
-    snprintf(buf, sizeof(buf),
-             "S: %d %d %d %d %d  | erro=%+3d | %s",
-             s1, s2, s3, s4, s5, erro, acaoAtual.c_str());
-    logMsg(buf);
-  }
+  delay(5);
 }
